@@ -1,0 +1,11 @@
+[package]
+name = "ak-inflate2"
+version = "0.1.0"
+authors = ["Dario Nieuwenhuis <dirbaio@dirbaio.net>"]
+edition = "2024"
+
+[features]
+std = []
+
+[dependencies]
+hex-literal = "0.3.3"
