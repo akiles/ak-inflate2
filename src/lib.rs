@@ -175,6 +175,11 @@ impl Tree {
         }
     }
 
+    fn reset(&mut self) {
+        self.len_count.copy_from_slice(&[0; MAX_SYMBOL_LEN]);
+        self.symbol.copy_from_slice(&[0; MAX_SYMBOL_COUNT]);
+    }
+
     fn fixed_len(&mut self) {
         self.len_count.fill(0);
         self.len_count[7] = 24;
@@ -324,15 +329,15 @@ impl Inflater {
                         self.update_state(State::ReadUncompressed { len: len as usize }, munch);
                     }
                     0b01 => {
-                        self.lit_tree = Tree::zeroed();
-                        self.dist_tree = Tree::zeroed();
+                        self.lit_tree.reset();
+                        self.dist_tree.reset();
                         self.lit_tree.fixed_len();
                         self.dist_tree.fixed_dist();
                         self.update_state(State::ReadCompressedSymbol, munch);
                     }
                     0b10 => {
-                        let mut lit_tree = Tree::zeroed();
-                        let mut dist_tree = Tree::zeroed();
+                        self.lit_tree.reset();
+                        self.dist_tree.reset();
                         let hlit = munch.read(5)? as usize + 257;
                         let hdist = munch.read(5)? as usize + 1;
                         let hclen = munch.read(4)? as usize + 4;
@@ -345,11 +350,9 @@ impl Inflater {
                         let mut len_tree = Tree::zeroed();
                         len_tree.build(&lens);
 
-                        lit_tree.decode(munch, &len_tree, hlit)?;
-                        dist_tree.decode(munch, &len_tree, hdist)?;
+                        self.lit_tree.decode(munch, &len_tree, hlit)?;
+                        self.dist_tree.decode(munch, &len_tree, hdist)?;
 
-                        self.lit_tree = lit_tree;
-                        self.dist_tree = dist_tree;
                         self.update_state(State::ReadCompressedSymbol, munch);
                     }
                     _ => unreachable!(),
@@ -447,19 +450,20 @@ mod test {
             let mut got: Vec<u8> = Vec::new();
             let mut inf = Inflater::new();
             let mut rpos = 0;
-            let chunk_size = 3;
-            let mut buf = Vec::new();
+            let mut blen = 0;
+            let mut buf = [0; 5];
             loop {
-                match inf.inflate(&buf[..], &mut got).await.unwrap() {
+                match inf.inflate(&buf[..blen], &mut got).await.unwrap() {
                     Status::Done => {
                         break;
                     }
                     Status::Fill { consumed } => {
                         buf.rotate_left(consumed);
-                        buf.truncate(buf.len() - consumed);
+                        blen = blen - consumed;
 
-                        let to_copy = (deflated.len() - rpos).min(chunk_size);
-                        buf.extend_from_slice(&deflated[rpos..rpos + to_copy]);
+                        let to_copy = (deflated.len() - rpos).min(buf.len() - blen);
+                        buf[blen..blen + to_copy].copy_from_slice(&deflated[rpos..rpos + to_copy]);
+                        blen = blen + to_copy;
                         rpos += to_copy;
                     }
                 }
