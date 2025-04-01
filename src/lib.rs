@@ -1,28 +1,29 @@
 #![cfg_attr(not(any(test, feature = "std")), no_std)]
+use core::future::Future;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Error {
     UnexpectedEof,
     Malformed,
-}
-
-pub trait Reader {
-    fn read(&mut self) -> u8;
+    Io,
 }
 
 pub trait Writer {
-    fn write(&mut self, byte: u8);
-    fn get(&mut self, offset: usize) -> u8;
+    type Error;
+    fn write(&mut self, byte: u8) -> impl Future<Output = Result<(), Self::Error>>;
+    fn get(&mut self, offset: usize) -> impl Future<Output = Result<u8, Self::Error>>;
 }
 
 #[cfg(feature = "std")]
 impl Writer for Vec<u8> {
-    fn write(&mut self, byte: u8) {
-        self.push(byte)
+    type Error = core::convert::Infallible;
+    async fn write(&mut self, byte: u8) -> Result<(), Self::Error> {
+        self.push(byte);
+        Ok(())
     }
 
-    fn get(&mut self, offset: usize) -> u8 {
-        self[self.len() - offset]
+    async fn get(&mut self, offset: usize) -> Result<u8, Self::Error> {
+        Ok(self[self.len() - offset])
     }
 }
 
@@ -33,13 +34,28 @@ struct BitMuncher<'a> {
     val_bits: u8,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct MunchState {
+    consumed: usize,
+    val: u16,
+    val_bits: u8,
+}
+
 impl<'a> BitMuncher<'a> {
-    fn new(data: &'a [u8]) -> Self {
+    fn new(data: &'a [u8], state: MunchState) -> Self {
         Self {
             data,
             pos: 0,
-            val: 0,
-            val_bits: 0,
+            val: state.val,
+            val_bits: state.val_bits,
+        }
+    }
+
+    fn state(&self) -> MunchState {
+        MunchState {
+            val: self.val,
+            val_bits: self.val_bits,
+            consumed: self.pos,
         }
     }
 
@@ -61,10 +77,10 @@ impl<'a> BitMuncher<'a> {
     }
 
     fn read_u8(&mut self) -> Result<u8, Error> {
-        self.val_bits = 0; // Remove in-progress bit
         if self.pos + 1 > self.data.len() {
             return Err(Error::UnexpectedEof);
         }
+        self.val_bits = 0; // Remove in-progress bit
 
         let res = self.data[self.pos];
         self.pos += 1;
@@ -72,10 +88,10 @@ impl<'a> BitMuncher<'a> {
     }
 
     fn read_u16(&mut self) -> Result<u16, Error> {
-        self.val_bits = 0; // Remove in-progress bit
         if self.pos + 2 > self.data.len() {
             return Err(Error::UnexpectedEof);
         }
+        self.val_bits = 0; // Remove in-progress bit
 
         let res = self.data[self.pos] as u16 | ((self.data[self.pos + 1] as u16) << 8);
         self.pos += 2;
@@ -232,76 +248,179 @@ static HUFF_LEN_ORDER: [u8; 19] = [
     16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15,
 ];
 
-pub fn inflate(data: &[u8], w: &mut impl Writer) -> Result<(), Error> {
-    let munch = &mut BitMuncher::new(data);
+pub struct Inflater {
+    lit_tree: Tree,
+    dist_tree: Tree,
+    state: State,
+    final_block: bool,
+    munch: MunchState,
+}
 
-    let mut lit_tree = Tree::zeroed();
-    let mut dist_tree = Tree::zeroed();
+#[derive(Debug, PartialEq)]
+pub enum State {
+    ReadHeader,
+    ReadUncompressed { len: usize },
+    ReadCompressedSymbol,
+    ReadCompressed { dist: usize, len: usize },
+    Done,
+}
 
-    loop {
-        let block_final = munch.read(1)?;
-        let block_type = munch.read(2)?;
-
-        match block_type {
-            0b00 => {
-                let len = munch.read_u16()?;
-                let nlen = munch.read_u16()?;
-                assert_eq!(len, !nlen);
-
-                for _ in 0..len {
-                    w.write(munch.read_u8()?);
-                }
-            }
-            0b01 | 0b10 => {
-                if block_type == 0b01 {
-                    lit_tree.fixed_len();
-                    dist_tree.fixed_dist();
-                } else {
-                    let hlit = munch.read(5)? as usize + 257;
-                    let hdist = munch.read(5)? as usize + 1;
-                    let hclen = munch.read(4)? as usize + 4;
-
-                    let mut lens = [0u8; MAX_SYMBOL_COUNT];
-                    for i in 0..hclen {
-                        lens[HUFF_LEN_ORDER[i] as usize] = munch.read(3)? as _;
-                    }
-
-                    let mut len_tree = Tree::zeroed();
-                    len_tree.build(&lens);
-
-                    lit_tree.decode(munch, &len_tree, hlit)?;
-                    dist_tree.decode(munch, &len_tree, hdist)?;
-                }
-
-                loop {
-                    match decode_symbol(munch, &lit_tree)? {
-                        sym @ 0..=255 => w.write(sym as _),
-                        256 => break,
-                        sym @ 257..=285 => {
-                            let sym = sym as usize - 257;
-                            let len =
-                                LEN_BASE[sym] as usize + munch.read(LEN_EXTRA_BITS[sym])? as usize;
-                            let sym = decode_symbol(munch, &dist_tree)? as usize;
-                            let dist = DIST_BASE[sym] as usize
-                                + munch.read(DIST_EXTRA_BITS[sym])? as usize;
-                            for _ in 0..len {
-                                let byte = w.get(dist);
-                                w.write(byte);
-                            }
-                        }
-                        _ => unreachable!(),
-                    }
-                }
-            }
-            _ => unreachable!(),
-        }
-
-        if block_final == 1 {
-            break;
+impl Inflater {
+    pub fn new() -> Self {
+        Self {
+            dist_tree: Tree::zeroed(),
+            lit_tree: Tree::zeroed(),
+            state: State::ReadHeader,
+            munch: MunchState {
+                val_bits: 0,
+                val: 0,
+                consumed: 0,
+            },
+            final_block: false,
         }
     }
 
-    Ok(())
+    /// Inflate into writer from data.
+    ///
+    /// The returned status indicates if the inflate was done, or if more
+    /// data is needed, in which case the amount of data consumed is returned.
+    ///
+    /// It's the callers responsibility to add more data to the buffer before calling inflate again.
+    pub async fn inflate<W: Writer>(&mut self, data: &[u8], w: &mut W) -> Result<Status, Error> {
+        self.munch.consumed = 0;
+        let munch = &mut BitMuncher::new(data, self.munch);
+        while State::Done != self.state {
+            match self.inflate_step(munch, w).await {
+                Ok(_) => {}
+                Err(Error::UnexpectedEof) => {
+                    let consumed = self.munch.consumed;
+                    return Ok(Status::Fill { consumed });
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(Status::Done)
+    }
+
+    fn update_state(&mut self, state: State, munch: &mut BitMuncher<'_>) {
+        self.state = state;
+        self.munch = munch.state();
+    }
+
+    async fn inflate_step<W: Writer>(
+        &mut self,
+        munch: &mut BitMuncher<'_>,
+        w: &mut W,
+    ) -> Result<(), Error> {
+        match self.state {
+            State::ReadHeader => {
+                let block_final = munch.read(1)?;
+                let block_type = munch.read(2)?;
+                match block_type {
+                    0b00 => {
+                        let len = munch.read_u16()?;
+                        let nlen = munch.read_u16()?;
+                        assert_eq!(len, !nlen);
+                        self.update_state(State::ReadUncompressed { len: len as usize }, munch);
+                    }
+                    0b01 => {
+                        self.lit_tree = Tree::zeroed();
+                        self.dist_tree = Tree::zeroed();
+                        self.lit_tree.fixed_len();
+                        self.dist_tree.fixed_dist();
+                        self.update_state(State::ReadCompressedSymbol, munch);
+                    }
+                    0b10 => {
+                        let mut lit_tree = Tree::zeroed();
+                        let mut dist_tree = Tree::zeroed();
+                        let hlit = munch.read(5)? as usize + 257;
+                        let hdist = munch.read(5)? as usize + 1;
+                        let hclen = munch.read(4)? as usize + 4;
+
+                        let mut lens = [0u8; MAX_SYMBOL_COUNT];
+                        for i in 0..hclen {
+                            lens[HUFF_LEN_ORDER[i] as usize] = munch.read(3)? as _;
+                        }
+
+                        let mut len_tree = Tree::zeroed();
+                        len_tree.build(&lens);
+
+                        lit_tree.decode(munch, &len_tree, hlit)?;
+                        dist_tree.decode(munch, &len_tree, hdist)?;
+
+                        self.lit_tree = lit_tree;
+                        self.dist_tree = dist_tree;
+                        self.update_state(State::ReadCompressedSymbol, munch);
+                    }
+                    _ => unreachable!(),
+                }
+                self.final_block = block_final == 1;
+            }
+            State::ReadUncompressed { len } => {
+                for i in 0..len {
+                    w.write(munch.read_u8()?).await.map_err(|_| Error::Io)?;
+                    self.update_state(State::ReadUncompressed { len: len - i - 1 }, munch);
+                }
+                let state = if self.final_block {
+                    State::Done
+                } else {
+                    State::ReadHeader
+                };
+                self.update_state(state, munch);
+            }
+            State::ReadCompressedSymbol => match decode_symbol(munch, &self.lit_tree)? {
+                sym @ 0..=255 => {
+                    w.write(sym as _).await.map_err(|_| Error::Io)?;
+                    self.munch = munch.state();
+                }
+                256 => {
+                    let state = if self.final_block {
+                        State::Done
+                    } else {
+                        State::ReadHeader
+                    };
+                    self.update_state(state, munch);
+                }
+                sym @ 257..=285 => {
+                    let sym = sym as usize - 257;
+                    let len = LEN_BASE[sym] as usize + munch.read(LEN_EXTRA_BITS[sym])? as usize;
+                    let sym = decode_symbol(munch, &self.dist_tree)? as usize;
+                    let dist = DIST_BASE[sym] as usize + munch.read(DIST_EXTRA_BITS[sym])? as usize;
+
+                    self.update_state(State::ReadCompressed { dist, len }, munch);
+                }
+                _ => unreachable!(),
+            },
+            State::ReadCompressed { dist, len } => {
+                for i in 0..len {
+                    let byte = w.get(dist).await.map_err(|_| Error::Io)?;
+                    w.write(byte).await.map_err(|_| Error::Io)?;
+                    self.update_state(
+                        State::ReadCompressed {
+                            dist,
+                            len: len - i - 1,
+                        },
+                        munch,
+                    );
+                }
+                self.update_state(State::ReadCompressedSymbol, munch);
+            }
+            State::Done => {}
+        }
+        Ok(())
+    }
+}
+
+/// Indicates status of inflation session
+#[derive(Debug)]
+pub enum Status {
+    /// Decmpression is done.
+    Done,
+    /// Needs more data.
+    Fill {
+        /// Data consumed from the buffer so far
+        consumed: usize,
+    },
 }
 
 #[cfg(test)]
@@ -312,12 +431,40 @@ mod test {
     use super::*;
     use std::vec::Vec;
 
-    #[test]
-    fn test_inflate() {
+    #[futures_test::test]
+    async fn test_inflate() {
         for (deflated, raw) in test_cases::TEST_CASES {
             let mut got: Vec<u8> = Vec::new();
-            inflate(deflated, &mut got).unwrap();
+            let mut inf = Inflater::new();
+            inf.inflate(deflated, &mut got).await.unwrap();
             assert_eq!(&got, raw);
+        }
+    }
+
+    #[futures_test::test]
+    async fn test_inflate_stream() {
+        for (deflated, raw) in test_cases::TEST_CASES {
+            let mut got: Vec<u8> = Vec::new();
+            let mut inf = Inflater::new();
+            let mut rpos = 0;
+            let chunk_size = 3;
+            let mut buf = Vec::new();
+            loop {
+                match inf.inflate(&buf[..], &mut got).await.unwrap() {
+                    Status::Done => {
+                        break;
+                    }
+                    Status::Fill { consumed } => {
+                        buf.rotate_left(consumed);
+                        buf.truncate(buf.len() - consumed);
+
+                        let to_copy = (deflated.len() - rpos).min(chunk_size);
+                        buf.extend_from_slice(&deflated[rpos..rpos + to_copy]);
+                        rpos += to_copy;
+                    }
+                }
+            }
+            assert_eq!(&got, raw, "Failed for input {:02x?}", deflated);
         }
     }
 }
