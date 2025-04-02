@@ -60,7 +60,7 @@ impl<'a> BitMuncher<'a> {
     }
 
     fn read(&mut self, bits: u8) -> Result<u8, Error> {
-        if self.val_bits < bits {
+        while self.val_bits < bits {
             if self.pos >= self.data.len() {
                 return Err(Error::UnexpectedEof);
             }
