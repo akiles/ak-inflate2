@@ -36,14 +36,14 @@ impl Writer for Vec<u8> {
 struct BitMuncher<'a> {
     data: &'a [u8],
     pos: usize,
-    val: u16,
+    val: u32,
     val_bits: u8,
 }
 
 #[derive(Clone, Copy, Debug)]
 struct MunchState {
     pos: usize,
-    val: u16,
+    val: u32,
     val_bits: u8,
 }
 
@@ -65,7 +65,7 @@ impl<'a> BitMuncher<'a> {
         }
     }
 
-    fn read(&mut self, bits: u8) -> Result<u16, Error> {
+    fn read(&mut self, bits: u8) -> Result<u32, Error> {
         println!("muncher: read {} {:?}", bits, self.state());
         while self.val_bits < bits {
             if self.pos >= self.data.len() {
@@ -73,7 +73,7 @@ impl<'a> BitMuncher<'a> {
             }
 
             let b = self.data[self.pos];
-            self.val |= (b as u16) << self.val_bits;
+            self.val |= (b as u32) << self.val_bits;
             self.val_bits += 8;
             self.pos += 1;
 
@@ -575,6 +575,23 @@ mod test {
         assert_eq!(0x5, m.read(4).unwrap());
         assert_eq!(0x55, m.read(8).unwrap());
         assert_eq!(0x5, m.read(4).unwrap());
+    }
+
+    #[test]
+    fn test_muncher_bitread3() {
+        let mut data = [0x55, 0x55, 0x55];
+        let mut m = BitMuncher::new(
+            &data,
+            MunchState {
+                val_bits: 0,
+                val: 0,
+                pos: 0,
+            },
+        );
+
+        assert_eq!(0x15, m.read(6).unwrap());
+        assert_eq!(0x555, m.read(12).unwrap());
+        assert_eq!(0x15, m.read(6).unwrap());
     }
 
     #[test]
