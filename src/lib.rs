@@ -42,7 +42,7 @@ struct BitMuncher<'a> {
 
 #[derive(Clone, Copy, Debug)]
 struct MunchState {
-    consumed: usize,
+    pos: usize,
     val: u16,
     val_bits: u8,
 }
@@ -61,32 +61,30 @@ impl<'a> BitMuncher<'a> {
         MunchState {
             val: self.val,
             val_bits: self.val_bits,
-            consumed: self.pos,
+            pos: self.pos,
         }
     }
 
     fn read(&mut self, bits: u8) -> Result<u16, Error> {
-        println!(
-            "read bits: {} (val_bits: {}), pos {} val {}",
-            bits, self.val_bits, self.pos, self.val
-        );
+        println!("muncher: read {} {:?}", bits, self.state());
         while self.val_bits < bits {
             if self.pos >= self.data.len() {
                 return Err(Error::UnexpectedEof);
             }
 
-            self.val |= (self.data[self.pos] as u16) << self.val_bits;
+            let b = self.data[self.pos];
+            self.val |= (b as u16) << self.val_bits;
             self.val_bits += 8;
             self.pos += 1;
+
+            println!("muncher: refill {} {:?}", b, self.state());
         }
 
         let res = self.val & ((1 << bits) - 1);
         self.val_bits -= bits;
         self.val >>= bits;
-        println!(
-            "res {}, val now {}, val_bits {}",
-            res, self.val, self.val_bits
-        );
+
+        println!("muncher: read done {} {:?}", res, self.state());
         Ok(res)
     }
 
@@ -231,7 +229,6 @@ fn decode_symbol(munch: &mut BitMuncher, tree: &Tree) -> Result<u16, Error> {
     let mut sum = 0;
 
     loop {
-        println!("muncher: {:?}", munch.state());
         let bit = munch.read(1)? as i32;
         code = (code << 1) + bit;
         code_len += 1;
@@ -308,7 +305,7 @@ impl Inflater {
             munch: MunchState {
                 val_bits: 0,
                 val: 0,
-                consumed: 0,
+                pos: 0,
             },
             final_block: false,
         }
@@ -321,13 +318,13 @@ impl Inflater {
     ///
     /// It's the callers responsibility to add more data to the buffer before calling inflate again.
     pub async fn inflate<W: Writer>(&mut self, data: &[u8], w: &mut W) -> Result<Status, Error> {
-        self.munch.consumed = 0;
+        self.munch.pos = 0;
         let munch = &mut BitMuncher::new(data, self.munch);
         while State::Done != self.state {
             match self.inflate_step(munch, w).await {
                 Ok(_) => {}
                 Err(Error::UnexpectedEof) => {
-                    let consumed = self.munch.consumed;
+                    let consumed = self.munch.pos;
                     return Ok(Status::Fill { consumed });
                 }
                 Err(e) => return Err(e),
@@ -527,12 +524,18 @@ mod test {
 
         let deflated = z.finish().unwrap();
         println!("DEFLATED: '{}", hex::encode(&deflated[..]));
+        std::fs::write("deflated.bin", &deflated).unwrap();
 
         let mut got: Vec<u8> = Vec::new();
         let mut inf = Inflater::new();
         inf.inflate(&deflated, &mut got).await.unwrap();
+        assert_eq!(got.len(), raw.len());
         for i in 0..got.len() {
-            println!("{} = {}", i, got[i]);
+            let mut diff = "";
+            if got[i] != raw[i] {
+                diff = "DIFFERENT!";
+            }
+            println!("{} = {} {} {}", i, got[i], raw[i], diff);
         }
         assert_eq!(&got, &raw);
     }
@@ -547,7 +550,7 @@ mod test {
                 MunchState {
                     val_bits: 0,
                     val: 0,
-                    consumed: 0,
+                    pos: 0,
                 },
             );
 
@@ -565,7 +568,7 @@ mod test {
             MunchState {
                 val_bits: 0,
                 val: 0,
-                consumed: 0,
+                pos: 0,
             },
         );
 
@@ -582,7 +585,7 @@ mod test {
             MunchState {
                 val_bits: 0,
                 val: 0,
-                consumed: 0,
+                pos: 0,
             },
         );
 
