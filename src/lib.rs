@@ -18,11 +18,17 @@ pub trait Writer {
 impl Writer for Vec<u8> {
     type Error = core::convert::Infallible;
     async fn write(&mut self, byte: u8) -> Result<(), Self::Error> {
+        println!("write {}", byte);
         self.push(byte);
         Ok(())
     }
 
     async fn get(&mut self, offset: usize) -> Result<u8, Self::Error> {
+        println!(
+            "read {}: {}",
+            self.len() - offset,
+            self[self.len() - offset]
+        );
         Ok(self[self.len() - offset])
     }
 }
@@ -59,7 +65,11 @@ impl<'a> BitMuncher<'a> {
         }
     }
 
-    fn read(&mut self, bits: u8) -> Result<u8, Error> {
+    fn read(&mut self, bits: u8) -> Result<u16, Error> {
+        println!(
+            "read bits: {} (val_bits: {}), pos {} val {}",
+            bits, self.val_bits, self.pos, self.val
+        );
         while self.val_bits < bits {
             if self.pos >= self.data.len() {
                 return Err(Error::UnexpectedEof);
@@ -73,13 +83,18 @@ impl<'a> BitMuncher<'a> {
         let res = self.val & ((1 << bits) - 1);
         self.val_bits -= bits;
         self.val >>= bits;
-        Ok(res as u8)
+        println!(
+            "res {}, val now {}, val_bits {}",
+            res, self.val, self.val_bits
+        );
+        Ok(res)
     }
 
     fn read_u8(&mut self) -> Result<u8, Error> {
         if self.pos + 1 > self.data.len() {
             return Err(Error::UnexpectedEof);
         }
+        assert!(self.val_bits == 0 || self.val_bits == 8);
         self.val_bits = 0; // Remove in-progress bit
 
         let res = self.data[self.pos];
@@ -91,6 +106,7 @@ impl<'a> BitMuncher<'a> {
         if self.pos + 2 > self.data.len() {
             return Err(Error::UnexpectedEof);
         }
+        assert!(self.val_bits == 0 || self.val_bits == 16);
         self.val_bits = 0; // Remove in-progress bit
 
         let res = self.data[self.pos] as u16 | ((self.data[self.pos + 1] as u16) << 8);
@@ -102,6 +118,7 @@ impl<'a> BitMuncher<'a> {
 const MAX_SYMBOL_COUNT: usize = 288;
 const MAX_SYMBOL_LEN: usize = 16;
 
+#[derive(Debug)]
 struct Tree {
     // How many codes are there with length i
     len_count: [u16; MAX_SYMBOL_LEN],
@@ -214,19 +231,31 @@ fn decode_symbol(munch: &mut BitMuncher, tree: &Tree) -> Result<u16, Error> {
     let mut sum = 0;
 
     loop {
+        println!("muncher: {:?}", munch.state());
         let bit = munch.read(1)? as i32;
-        code = code * 2 + bit;
+        code = (code << 1) + bit;
         code_len += 1;
+
+        println!(
+            "[decode] code {}, code_len {}, bit {}, sum {}",
+            code, code_len, bit, sum
+        );
 
         assert!(code_len < MAX_SYMBOL_LEN);
 
+        let len_count = tree.len_count[code_len];
+        println!("len count: {}", len_count);
         code -= tree.len_count[code_len] as i32;
         sum += tree.len_count[code_len] as i32;
+        println!("after: code {}, sum {}", code, sum);
         if code < 0 {
             break;
         }
     }
     sum += code;
+    println!("end sum = {}", sum);
+    // 83 => 31
+    // 87 => 38
 
     assert!(sum >= 0 && (sum as usize) < tree.symbol.len());
     Ok(tree.symbol[sum as usize])
@@ -317,6 +346,7 @@ impl Inflater {
         munch: &mut BitMuncher<'_>,
         w: &mut W,
     ) -> Result<(), Error> {
+        println!("step state {:?}", self.state);
         match self.state {
             State::ReadHeader => {
                 let block_final = munch.read(1)?;
@@ -333,6 +363,7 @@ impl Inflater {
                         self.dist_tree.reset();
                         self.lit_tree.fixed_len();
                         self.dist_tree.fixed_dist();
+                        println!("FIXED HEADER");
                         self.update_state(State::ReadCompressedSymbol, munch);
                     }
                     0b10 => {
@@ -352,7 +383,7 @@ impl Inflater {
 
                         self.lit_tree.decode(munch, &len_tree, hlit)?;
                         self.dist_tree.decode(munch, &len_tree, hdist)?;
-
+                        println!("lit_tree decode: {:?}", self.lit_tree);
                         self.update_state(State::ReadCompressedSymbol, munch);
                     }
                     _ => unreachable!(),
@@ -386,9 +417,17 @@ impl Inflater {
                 }
                 sym @ 257..=285 => {
                     let sym = sym as usize - 257;
+                    println!("sym 1 {}", sym);
                     let len = LEN_BASE[sym] as usize + munch.read(LEN_EXTRA_BITS[sym])? as usize;
                     let sym = decode_symbol(munch, &self.dist_tree)? as usize;
-                    let dist = DIST_BASE[sym] as usize + munch.read(DIST_EXTRA_BITS[sym])? as usize;
+                    println!("sym 2 {}", sym);
+                    let dist_base = DIST_BASE[sym] as usize;
+                    let bits_to_read = DIST_EXTRA_BITS[sym];
+                    println!("going to read {} bits", bits_to_read);
+                    let dist_extra = munch.read(bits_to_read)? as usize;
+                    println!("dist base = {}, dist extra = {}", dist_base, dist_extra);
+                    let dist = dist_base + dist_extra;
+                    //                    let dist = if dist == 1026 { dist + 256 } else { dist };
 
                     self.update_state(State::ReadCompressed { dist, len }, munch);
                 }
@@ -470,5 +509,85 @@ mod test {
             }
             assert_eq!(&got, raw, "Failed for input {:02x?}", deflated);
         }
+    }
+
+    #[futures_test::test]
+    async fn test_inflate_example() {
+        use flate2::Compress;
+        use flate2::Compression;
+        use flate2::write::ZlibEncoder;
+        use hex_literal::hex;
+        use std::io::prelude::*;
+        let raw = hex!(
+            "8b8bec8bffff8b8b8b4000000f0400000000ffe5ff6d6d0000000053530f0400000000ffe5ff6d6d0000000053535353535353535353535337000040535353535353ffffff1500005353533253ffff15000000ff6dff0f0000abb1b1b1b3b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b10000000000ffffff6df7f723f7f7f7f7f7ce0000000000a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3000000000000000000000000000000000000000000000000000000000000a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3000088f7f7f7f7f7f7f7ffffff0008fff7f7f743f7f7f7f7000000ffe5ff6d6d000000005353535353535353535353533600a60040535353535353ffff000007000040000000000037000040318b078b0000ff3740ffffff15000000ff6d4747474747474747474747474747474747474747474747ffffffffacf7f7f7f7f7f7f7ce0000000000000088f7f7f7f7f7f7f7ffffff0008fff7f7f743f7f7f7f70000006ddb0000ff3740ffffff15000000ff6dffffffff6df7f7f7f7f7f741f7f76d00000d000000ffffff330000408bffff37f4efefefefefefefefefefefefefefefeffffff7f7ffffffffffffffffffffffffffffffffffffffffffff0200000000000000ffffff6363636373636363ffffffaaffffffffffffbf48ff0000000000000000ffff000000000000004000ffffffff1efffffffffffffffffbffffffffffffffffffffffffffffffffffffffff8c3d025dffffffffffff6dffffffff6df774f7883f00001ad5ffff29fdd5fffdff29ffff2bfd4a692173f8f7f7f7f7ff5aff000000038b8bff3700004031052f492006138b6774f5ff3f00002998ffffff3d8b8b23c8153a720088fdd100005007070000002822071172988c07ff50000000fd8824000011dc360000ab939393939393408bffff37f4efefefefefefefefefefefefefefefeffffff7f7ffffffffffffffffffffffffffffffffffffffffffff0200000000000000ffffff6363636373636363ffffffaaffffffffffffbf48ff0000000000000000ffff000000000000004000ffffffff1efffffffffffffffffbffffffffffffffffffffffffffffffffffffffff8c3d025dffffffffffff6dffffffff6df774f7883f00001ad5ffff29fdd5fffdff29ffff2bfd4a692173f8f7f7f7f7ff5aff000000038b8bff3700004031052f492006138b6774f5ff3f00002998ffffff3d8b8b23c8153a720088fdd100005007070000002822071172988c07ff50000000fd8824000011dc360000ab9393939393939393939393939393939393939393939393939393939393939393930a72ff170a72ff05492000ff170d00000000000000000000000800003afffffff7f7f7f743f7f7f76d48000000ffe5ff6d6d87fff9ffffff00ff87ffffe500000000fffff7f7f70300000000000000f727f7f7f743f7f7f76d48000000000048488b8b23c8153a7200888b8bec8bff010b8b8b04000000006d6de500ffff0000005353535353535353535353533700004053535353535b5353533253535353008bff000000000007000040000000004000000000000037000040318bfffdd100005007070000002207117298ff50008b0000ff3740ffffff15000000ff6dffffffff020400fa0004000000000000ffff8b8b8b8bffff39004100000dff37400340ff30000092929292929292000000040000400092929292923c41f7f76d00000d00ff00ff5d0000000040318b9292929292929492929292929292929292929292929292929292928b06318b44b8929292925d0000ffffff330000408bffff37f4ff3b5b2f0a06318b44b8929292925d0000ffffff330a00408bffff37f4ff3b5b2f0a72ff1fa503a0b8052f4920061300407af9fd023d501c010000fcfcff3040ff00005d40ff6df7f79393939393939393939393939393939393939393939393939393930a72ff170a72ff05492000ff170d00000000000000000000000800003afffffff7f7f7f743f7f7f76d48000000ffe5ff6d6d87fff9ffffff00ff87ffffe500000000fffff7f7f70300000000000000f727f7f7f743f7f7f76d48000000000048488b8b23c8153a7200888b8bec8bff010b8b8b04000000006d6de500ffff0000005353535353535353535353533700004053535353535b5353533253535353008bff000000000007000040000000004000000000000037000040318bfffdd100005007070000002207117298ff50008b0000ff3740ffffff15000000ff6dffffffff020400fa0004000000000000ffff8b8b8b8bffff39004100000dff37400340ff30000092929292929292000000040000400092929292923c41f7f76d00000d00ff00ff5d0000000040318b9292929292929492929292929292929292929292929292929292928b06318b44b8929292925d0000ffffff330000408bffff37f4ff3b5b2f0a06318b44b8929292925d0000ffffff330a00408bffff37f4ff3b5b2f0a72ff1fa503a0b8052f4920061300407af9fd023d501c010000fcfcff3040ff00005d40ff6df7f7f7f7f7f7f7ce00000000000000ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffddf8117298fcff002c0100000000000004f97fffffffffff1717171788f7f7f7f7f7f7f7ffffff0008fff7f7f743f7f7f7f70000006d480000000000484848ffff6dff0001ff6df79af7ffffff4100000de200000000000000fffff7f7ff6363636373636363ffffffaaffffffffffff0000fd88230a24000011dcff8b00003600002b0a72ff1703ff3717171717ffffffff5353538b00005353536a6aca6aff00ffff000040bf0000ffff0005004000ffffff41f7f76dffffffffffffffffffffffffffffffffffffffffffff00000d00ff318bffff8b268b48ff31ffff17171788f7f7f7f7f7f7"
+        );
+        let c = Compress::new_with_window_bits(Compression::new(9), false, 15);
+        let mut z = ZlibEncoder::new_with_compress(Vec::new(), c);
+        z.write_all(&raw).unwrap();
+
+        let deflated = z.finish().unwrap();
+        println!("DEFLATED: '{}", hex::encode(&deflated[..]));
+
+        let mut got: Vec<u8> = Vec::new();
+        let mut inf = Inflater::new();
+        inf.inflate(&deflated, &mut got).await.unwrap();
+        for i in 0..got.len() {
+            println!("{} = {}", i, got[i]);
+        }
+        assert_eq!(&got, &raw);
+    }
+
+    #[test]
+    fn test_muncher_bitreading() {
+        let mut data = [0x55, 0x55];
+        for bits in 1..16 {
+            println!("Reading {} bits", bits);
+            let mut m = BitMuncher::new(
+                &data,
+                MunchState {
+                    val_bits: 0,
+                    val: 0,
+                    consumed: 0,
+                },
+            );
+
+            let expected = 0x5555 & ((1 << bits) - 1);
+            let val = m.read(bits).unwrap();
+            assert_eq!(expected, val, "failed to read {} bits", bits);
+        }
+    }
+
+    #[test]
+    fn test_muncher_bitread2() {
+        let mut data = [0x55, 0x55];
+        let mut m = BitMuncher::new(
+            &data,
+            MunchState {
+                val_bits: 0,
+                val: 0,
+                consumed: 0,
+            },
+        );
+
+        assert_eq!(0x5, m.read(4).unwrap());
+        assert_eq!(0x55, m.read(8).unwrap());
+        assert_eq!(0x5, m.read(4).unwrap());
+    }
+
+    #[test]
+    fn test_muncher_bitread_mix() {
+        let mut data = [0x55, 0x55];
+        let mut m = BitMuncher::new(
+            &data,
+            MunchState {
+                val_bits: 0,
+                val: 0,
+                consumed: 0,
+            },
+        );
+
+        assert_eq!(0x5, m.read(4).unwrap());
+        assert_eq!(0x55, m.read_u8().unwrap());
+        assert_eq!(0x5, m.read(4).unwrap());
     }
 }

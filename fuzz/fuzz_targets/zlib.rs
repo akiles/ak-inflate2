@@ -3,6 +3,8 @@
 use ak_inflate2::Inflater;
 use flate2::Compress;
 use flate2::Compression;
+use flate2::Decompress;
+use flate2::read::ZlibDecoder;
 use flate2::write::ZlibEncoder;
 use futures::executor::block_on;
 use libfuzzer_sys::fuzz_target;
@@ -19,6 +21,13 @@ fuzz_target!(|data: &[u8]| {
     let mut inflated = Vec::new();
     let mut inf = Inflater::new();
 
-    block_on(inf.inflate(compressed, &mut inflated)).unwrap();
+    block_on(inf.inflate(&compressed[..], &mut inflated)).unwrap();
+
+    let d = Decompress::new_with_window_bits(false, 15);
+    let mut zd = ZlibDecoder::new_with_decompress(&compressed[..], d);
+    let mut z_inflated = Vec::new();
+    zd.read_to_end(&mut z_inflated).unwrap();
+
+    assert_eq!(data, &z_inflated[..]);
     assert_eq!(data, &inflated[..]);
 });
