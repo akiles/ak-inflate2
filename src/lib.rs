@@ -92,8 +92,8 @@ impl<'a> BitMuncher<'a> {
         if self.pos + 1 > self.data.len() {
             return Err(Error::UnexpectedEof);
         }
-        assert!(self.val_bits == 0 || self.val_bits == 8);
         self.val_bits = 0; // Remove in-progress bit
+        self.val = 0;
 
         let res = self.data[self.pos];
         self.pos += 1;
@@ -104,8 +104,8 @@ impl<'a> BitMuncher<'a> {
         if self.pos + 2 > self.data.len() {
             return Err(Error::UnexpectedEof);
         }
-        assert!(self.val_bits == 0 || self.val_bits == 16);
         self.val_bits = 0; // Remove in-progress bit
+        self.val = 0;
 
         let res = self.data[self.pos] as u16 | ((self.data[self.pos + 1] as u16) << 8);
         self.pos += 2;
@@ -596,7 +596,7 @@ mod test {
 
     #[test]
     fn test_muncher_bitread_mix() {
-        let mut data = [0x55, 0x55];
+        let mut data = [0x55, 0xaa, 0x88];
         let mut m = BitMuncher::new(
             &data,
             MunchState {
@@ -607,7 +607,7 @@ mod test {
         );
 
         assert_eq!(0x5, m.read(4).unwrap());
-        assert_eq!(0x55, m.read_u8().unwrap());
-        assert_eq!(0x5, m.read(4).unwrap());
+        assert_eq!(0xaa, m.read_u8().unwrap());
+        assert_eq!(0x8, m.read(4).unwrap());
     }
 }
