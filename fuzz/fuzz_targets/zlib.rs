@@ -22,6 +22,10 @@ fuzz_target!(|data: &[u8]| {
     let mut inf = Inflater::new();
 
     block_on(inf.inflate(&compressed[..], &mut inflated)).unwrap();
+    assert_eq!(data, &inflated[..]);
+});
+
+
 
     let d = Decompress::new_with_window_bits(false, 15);
     let mut zd = ZlibDecoder::new_with_decompress(&compressed[..], d);
@@ -29,5 +33,4 @@ fuzz_target!(|data: &[u8]| {
     zd.read_to_end(&mut z_inflated).unwrap();
 
     assert_eq!(data, &z_inflated[..]);
-    assert_eq!(data, &inflated[..]);
 });
