@@ -18,17 +18,11 @@ pub trait Writer {
 impl Writer for Vec<u8> {
     type Error = core::convert::Infallible;
     async fn write(&mut self, byte: u8) -> Result<(), Self::Error> {
-        println!("write {}", byte);
         self.push(byte);
         Ok(())
     }
 
     async fn get(&mut self, offset: usize) -> Result<u8, Self::Error> {
-        println!(
-            "read {}: {}",
-            self.len() - offset,
-            self[self.len() - offset]
-        );
         Ok(self[self.len() - offset])
     }
 }
@@ -66,7 +60,7 @@ impl<'a> BitMuncher<'a> {
     }
 
     fn read(&mut self, bits: u8) -> Result<u32, Error> {
-        println!("muncher: read {} {:?}", bits, self.state());
+        // println!("muncher: read {} {:?}", bits, self.state());
         while self.val_bits < bits {
             if self.pos >= self.data.len() {
                 return Err(Error::UnexpectedEof);
@@ -77,14 +71,14 @@ impl<'a> BitMuncher<'a> {
             self.val_bits += 8;
             self.pos += 1;
 
-            println!("muncher: refill {} {:?}", b, self.state());
+            // println!("muncher: refill {} {:?}", b, self.state());
         }
 
         let res = self.val & ((1 << bits) - 1);
         self.val_bits -= bits;
         self.val >>= bits;
 
-        println!("muncher: read done {} {:?}", res, self.state());
+        // println!("muncher: read done {} {:?}", res, self.state());
         Ok(res)
     }
 
@@ -233,26 +227,24 @@ fn decode_symbol(munch: &mut BitMuncher, tree: &Tree) -> Result<u16, Error> {
         code = (code << 1) + bit;
         code_len += 1;
 
-        println!(
-            "[decode] code {}, code_len {}, bit {}, sum {}",
-            code, code_len, bit, sum
-        );
+        // println!(
+        //     "[decode] code {}, code_len {}, bit {}, sum {}",
+        //     code, code_len, bit, sum
+        // );
 
         assert!(code_len < MAX_SYMBOL_LEN);
 
-        let len_count = tree.len_count[code_len];
-        println!("len count: {}", len_count);
+        // let len_count = tree.len_count[code_len];
+        // println!("len count: {}", len_count);
         code -= tree.len_count[code_len] as i32;
         sum += tree.len_count[code_len] as i32;
-        println!("after: code {}, sum {}", code, sum);
+        // println!("after: code {}, sum {}", code, sum);
         if code < 0 {
             break;
         }
     }
     sum += code;
-    println!("end sum = {}", sum);
-    // 83 => 31
-    // 87 => 38
+    // println!("end sum = {}", sum);
 
     assert!(sum >= 0 && (sum as usize) < tree.symbol.len());
     Ok(tree.symbol[sum as usize])
@@ -343,7 +335,7 @@ impl Inflater {
         munch: &mut BitMuncher<'_>,
         w: &mut W,
     ) -> Result<(), Error> {
-        println!("step state {:?}", self.state);
+        // println!("step state {:?}", self.state);
         match self.state {
             State::ReadHeader => {
                 let block_final = munch.read(1)?;
@@ -360,7 +352,6 @@ impl Inflater {
                         self.dist_tree.reset();
                         self.lit_tree.fixed_len();
                         self.dist_tree.fixed_dist();
-                        println!("FIXED HEADER");
                         self.update_state(State::ReadCompressedSymbol, munch);
                     }
                     0b10 => {
@@ -380,7 +371,6 @@ impl Inflater {
 
                         self.lit_tree.decode(munch, &len_tree, hlit)?;
                         self.dist_tree.decode(munch, &len_tree, hdist)?;
-                        println!("lit_tree decode: {:?}", self.lit_tree);
                         self.update_state(State::ReadCompressedSymbol, munch);
                     }
                     _ => unreachable!(),
@@ -414,17 +404,12 @@ impl Inflater {
                 }
                 sym @ 257..=285 => {
                     let sym = sym as usize - 257;
-                    println!("sym 1 {}", sym);
                     let len = LEN_BASE[sym] as usize + munch.read(LEN_EXTRA_BITS[sym])? as usize;
                     let sym = decode_symbol(munch, &self.dist_tree)? as usize;
-                    println!("sym 2 {}", sym);
                     let dist_base = DIST_BASE[sym] as usize;
                     let bits_to_read = DIST_EXTRA_BITS[sym];
-                    println!("going to read {} bits", bits_to_read);
                     let dist_extra = munch.read(bits_to_read)? as usize;
-                    println!("dist base = {}, dist extra = {}", dist_base, dist_extra);
                     let dist = dist_base + dist_extra;
-                    //                    let dist = if dist == 1026 { dist + 256 } else { dist };
 
                     self.update_state(State::ReadCompressed { dist, len }, munch);
                 }
@@ -542,7 +527,7 @@ mod test {
 
     #[test]
     fn test_muncher_bitreading() {
-        let mut data = [0x55, 0x55];
+        let data = [0x55, 0x55];
         for bits in 1..16 {
             println!("Reading {} bits", bits);
             let mut m = BitMuncher::new(
@@ -562,7 +547,7 @@ mod test {
 
     #[test]
     fn test_muncher_bitread2() {
-        let mut data = [0x55, 0x55];
+        let data = [0x55, 0x55];
         let mut m = BitMuncher::new(
             &data,
             MunchState {
@@ -579,7 +564,7 @@ mod test {
 
     #[test]
     fn test_muncher_bitread3() {
-        let mut data = [0x55, 0x55, 0x55];
+        let data = [0x55, 0x55, 0x55];
         let mut m = BitMuncher::new(
             &data,
             MunchState {
@@ -596,7 +581,7 @@ mod test {
 
     #[test]
     fn test_muncher_bitread_mix() {
-        let mut data = [0x55, 0xaa, 0x88];
+        let data = [0x55, 0xaa, 0x88];
         let mut m = BitMuncher::new(
             &data,
             MunchState {
